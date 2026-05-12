@@ -7,6 +7,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
     <style>
         :root { --taipei-blue: #008CBA; --taipei-blue-dark: #007399; }
 
@@ -61,7 +63,7 @@
             <div id="video-container" class="relative w-full aspect-video bg-black flex-shrink-0 border-b-2 border-taipei-main shadow-inner">
 
                 <!-- MP4 影片本體：給一般可直接播放的 .mp4 使用 -->
-                <video id="live-video" class="absolute inset-0 w-full h-full object-cover opacity-90 z-10" playsinline muted loop controls></video>
+                <video id="live-video" class="absolute inset-0 w-full h-full object-cover opacity-90 z-10 hidden" playsinline muted loop controls></video>
 
                 <!-- Streamable Embed：給古亭河濱籃球場使用 -->
                 <div id="streamable-wrapper" class="absolute inset-0 w-full h-full z-10 hidden bg-black">
@@ -163,26 +165,14 @@
 
     </div>
 
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
-        import {
-            getDatabase,
-            ref,
-            push,
-            onChildAdded,
-            onValue,
-            query,
-            orderByChild,
-            limitToLast
-        } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
-
+    <script>
         // === Firebase 設定 ===
         // 這裡使用你提供的 Firebase Web App 設定，並補上 Realtime Database URL。
         // 如果 Firebase Console 的 Realtime Database URL 不是這個，請把 databaseURL 改成 Data 分頁顯示的完整 URL。
         const firebaseConfig = {
             apiKey: "AIzaSyBgUmQRf2O6IRwTXDmxpT-O1OqP-fclBF4",
             authDomain: "taipeiipass-f2800.firebaseapp.com",
-            databaseURL: "https://taipeiipass-f2800-default-rtdb.firebaseio.com",
+            databaseURL: "https://taipeiipass-f2800-default-rtdb.asia-southeast1.firebasedatabase.app",
             projectId: "taipeiipass-f2800",
             storageBucket: "taipeiipass-f2800.firebasestorage.app",
             messagingSenderId: "210881365568",
@@ -190,8 +180,16 @@
             measurementId: "G-9K3RB4YLT1"
         };
 
-        const app = initializeApp(firebaseConfig);
-        const db = getDatabase(app, firebaseConfig.databaseURL);
+        let db = null;
+        let firebaseReady = false;
+
+        try {
+            firebase.initializeApp(firebaseConfig);
+            db = firebase.database();
+            firebaseReady = true;
+        } catch (error) {
+            console.error("Firebase 初始化失敗", error);
+        }
 
         // === 發言頻率限制 ===
         // 不使用匿名登入時，這個限制是「同一瀏覽器」層級。
@@ -262,7 +260,8 @@
         let danmakus = []; 
         let isHeatmapActive = false;
         let heatmapLayers = []; 
-        let firebaseUnsubscribe = null;
+        let firebaseListenerRef = null;
+        let firebaseChildAddedCallback = null;
         let seenFirebaseKeys = new Set();
 
         let danmakuPools = {
@@ -288,15 +287,24 @@
 
         // === Firebase 連線狀態 ===
         const statusTag = document.getElementById('status-tag');
-        onValue(ref(db, ".info/connected"), (snapshot) => {
-            if (snapshot.val() === true) {
-                statusTag.innerText = "多人彈幕已連線";
-                statusTag.className = "text-[10px] bg-green-400/90 text-white px-2 py-1 rounded-full animate-pulse font-medium";
-            } else {
-                statusTag.innerText = "Firebase 連線中";
-                statusTag.className = "text-[10px] bg-yellow-400/90 text-white px-2 py-1 rounded-full animate-pulse font-medium";
-            }
-        });
+
+        function setStatus(text, className) {
+            if (!statusTag) return;
+            statusTag.innerText = text;
+            statusTag.className = className;
+        }
+
+        if (firebaseReady && db) {
+            db.ref(".info/connected").on("value", (snapshot) => {
+                if (snapshot.val() === true) {
+                    setStatus("多人彈幕已連線", "text-[10px] bg-green-400/90 text-white px-2 py-1 rounded-full animate-pulse font-medium");
+                } else {
+                    setStatus("Firebase 連線中", "text-[10px] bg-yellow-400/90 text-white px-2 py-1 rounded-full animate-pulse font-medium");
+                }
+            });
+        } else {
+            setStatus("Firebase 初始化失敗", "text-[10px] bg-red-500/90 text-white px-2 py-1 rounded-full font-medium");
+        }
 
         // === 地圖系統初始化 ===
         let map;
@@ -508,7 +516,8 @@
         function resize() {
             if(canvas && container) {
                 canvas.width = container.clientWidth;
-                canvas.height = container.clientHei         }
+                canvas.height = container.clientHeight;
+            }
         }
 
         window.addEventListener('resize', resize);
@@ -563,49 +572,53 @@
         animate();
 
         function startFirebaseDanmakuListener(stadiumId) {
-            if (typeof firebaseUnsubscribe === "function") {
-                firebaseUnsubscribe();
-                firebaseUnsubscribe = null;
+            if (firebaseListenerRef && firebaseChildAddedCallback) {
+                firebaseListenerRef.off("child_added", firebaseChildAddedCallback);
+                firebaseListenerRef = null;
+                firebaseChildAddedCallback = null;
             }
 
             seenFirebaseKeys = new Set();
 
-            const danmakuQuery = query(
-                ref(db, `danmaku/${stadiumId}`),
-                orderByChild("time"),
-                limitToLast(30)
-            );
+            if (!firebaseReady || !db) {
+                console.warn("Firebase 尚未就緒，無法啟用多人彈幕");
+                return;
+            }
 
-            firebaseUnsubscribe = onChildAdded(
-                danmakuQuery,
-                (snapshot) => {
-                    if (seenFirebaseKeys.has(snapshot.key)) return;
-                    seenFirebaseKeys.add(snapshot.key);
+            firebaseListenerRef = db.ref(`danmaku/${stadiumId}`).orderByChild("time").limitToLast(30);
 
-                    const msg = snapshot.val();
-                    if (!msg || typeof msg.text !== "string" || typeof msg.time !== "number") return;
+            firebaseChildAddedCallback = (snapshot) => {
+                if (seenFirebaseKeys.has(snapshot.key)) return;
+                seenFirebaseKeys.add(snapshot.key);
 
-                    const date = new Date(msg.time);
-                    const pad = n => n.toString().padStart(2, '0');
-                    const timeStr = `[${pad(date.getHours())}:${pad(date.getMinutes())}] `;
-                    const isSelf = myMessageKeys.has(snapshot.key);
+                const msg = snapshot.val();
+                if (!msg || typeof msg.text !== "string" || typeof msg.time !== "number") return;
 
-                    if (!danmakuPools[stadiumId]) {
-                        danmakuPools[stadiumId] = [];
-                    }
+                const date = new Date(msg.time);
+                const pad = n => n.toString().padStart(2, '0');
+                const timeStr = `[${pad(date.getHours())}:${pad(date.getMinutes())}] `;
+                const isSelf = myMessageKeys.has(snapshot.key);
 
-                    danmakuPools[stadiumId].push({
-                        text: msg.text,
-                        isSelf,
-                        timestamp: msg.time,
-                        timeStr
-                    });
+                if (!danmakuPools[stadiumId]) {
+                    danmakuPools[stadiumId] = [];
+                }
 
-                    // 15 秒內的新訊息直接顯示；較舊的 last 30 則留給下方輪播機制慢慢顯示，避免切換場館時一次爆量。
-                    if (Date.now() - msg.time <= 15000) {
-                        danmakus.push(new Bullet(msg.text, isSelf, timeStr));
-                    }
-                },
+                danmakuPools[stadiumId].push({
+                    text: msg.text,
+                    isSelf,
+                    timestamp: msg.time,
+                    timeStr
+                });
+
+                // 15 秒內的新訊息直接顯示；較舊的 last 30 則留給下方輪播機制慢慢顯示，避免切換場館時一次爆量。
+                if (Date.now() - msg.time <= 15000) {
+                    danmakus.push(new Bullet(msg.text, isSelf, timeStr));
+                }
+            };
+
+            firebaseListenerRef.on(
+                "child_added",
+                firebaseChildAddedCallback,
                 (error) => {
                     console.error("Firebase 彈幕讀取失敗", error);
                     showWarningModal("Firebase 讀取失敗", "請檢查 Realtime Database Rules 是否允許讀取 danmaku，或 databaseURL 是否正確。");
@@ -615,7 +628,7 @@
 
         // 審核系統
         function showWarningModal(title = "系統提醒", message = "您的留言已自動處理。") {
-            document.getElementByIdg-title').innerText = title;
+            document.getElementById('warning-title').innerText = title;
             document.getElementById('warning-message').innerHTML = message;
             document.getElementById('warning-modal').classList.remove('hidden');
         }
@@ -636,7 +649,7 @@
             const remaining = getRemainingCooldownMs();
 
             if (remaining > 0) {
-             onst seconds = Math.ceil(remaining / 1000);
+                const seconds = Math.ceil(remaining / 1000);
                 btn.disabled = true;
                 btn.innerText = `${seconds}s`;
                 btn.classList.add('opacity-60', 'cursor-not-allowed');
@@ -650,7 +663,7 @@
         setInterval(updateSendButtonCooldown, 500);
 
         async function sendMessage() {
-            const inp document.getElementById('danmaku-input');
+            const input = document.getElementById('danmaku-input');
             if(!input) return;
 
             const remaining = getRemainingCooldownMs();
@@ -663,7 +676,7 @@
             if(!originalText) return;
 
             if (originalText.length > 80) {
-               t = originalText.slice(0, 80);
+                originalText = originalText.slice(0, 80);
             }
 
             let filteredText = originalText;
@@ -681,20 +694,25 @@
                 showWarningModal("系統提醒", "留言含有不當字詞，已自動遮蔽後送出。");
             }
 
+            if (!firebaseReady || !db) {
+                showWarningModal("Firebase 尚未連線", "目前無法送出多人彈幕。請檢查 Firebase SDK、databaseURL，或瀏覽器 Console 錯誤訊息。");
+                return;
+            }
+
             try {
                 const now = Date.now();
-                const newMessageRef = push(ref(db, `danmaku/${currentStadium.id}`), {
-                    text: filteredText,
-                    time: now
-                });
+                const newMessageRef = db.ref(`danmaku/${currentStadium.id}`).push();
 
                 if (newMessageRef.key) {
                     myMessageKeys.add(newMessageRef.key);
                 }
 
-                await newMessageRef;
+                await newMessageRef.set({
+                    text: filteredText,
+                    time: now
+                });
 
-                localStorageT_SENT_KEY, String(now));
+                localStorage.setItem(LAST_SENT_KEY, String(now));
                 input.value = "";
                 input.blur();
                 updateSendButtonCooldown();
@@ -718,14 +736,14 @@
             currentPool = currentPool.filter(msg => now - msg.timestamp < 3600000);
             danmakuPools[stadiumId] = currentPool; 
 
-            // 如果是一般 video，且 就不發射自動彈幕。
+            // 如果是一般 video，且 video 暫停中，就不發射自動彈幕。
             // 如果是 Streamable iframe，無法直接讀取播放狀態，因此彈幕照常輪播。
             const isUsingEmbed = !!currentStadium.embed;
             if (!isUsingEmbed && videoElement && videoElement.paused && videoElement.style.display !== 'none') return;
 
             if (currentPool.length > 0 && danmakus.length < 10) {
                 const randomMsg = currentPool[Math.floor(Math.random() * currentPool.length)];
-                const fullText = randomM.timeStr + randomMsg.text;
+                const fullText = randomMsg.timeStr + randomMsg.text;
                 const isRepeated = danmakus.some(b => b.text === fullText);
 
                 if (!isRepeated) {
@@ -739,7 +757,7 @@
             const now = new Date();
             const timeEl = document.getElementById('cctv-timestamp');
             if(timeEl) {
-                timeEl.innerText = noweString('zh-TW', { hour12: false });
+                timeEl.innerText = now.toLocaleString('zh-TW', { hour12: false });
             }
         }, 1000);
 
@@ -759,4 +777,3 @@
     </script>
 </body>
 </html>
-
