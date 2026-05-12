@@ -196,6 +196,8 @@
         // 使用者清除 localStorage、換瀏覽器、開無痕模式就能繞過；若要伺服器級限制，必須加 Firebase Auth。
         const RATE_LIMIT_MS = 30000;
         const LAST_SENT_KEY = "taipei-danmaku-last-sent-at";
+        const MESSAGE_TTL_MS = 60 * 60 * 1000; // Firebase 彈幕保留 1 小時
+        const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 每 5 分鐘嘗試清理一次舊資料
         const myMessageKeys = new Set();
 
         // === Base64 預設備用圖片 ===
@@ -496,6 +498,7 @@
 
             renderStadiumList();
             startFirebaseDanmakuListener(currentStadium.id);
+            cleanupOldDanmaku(currentStadium.id);
         }
 
         function renderStadiumList() {
@@ -585,7 +588,11 @@
                 return;
             }
 
-            firebaseListenerRef = db.ref(`danmaku/${stadiumId}`).orderByChild("time").limitToLast(30);
+            // 只讀取 1 小時內的最新 30 則，避免舊資料又被載回畫面。
+            firebaseListenerRef = db.ref(`danmaku/${stadiumId}`)
+                .orderByChild("time")
+                .startAt(Date.now() - MESSAGE_TTL_MS)
+                .limitToLast(30);
 
             firebaseChildAddedCallback = (snapshot) => {
                 if (seenFirebaseKeys.has(snapshot.key)) return;
@@ -593,6 +600,9 @@
 
                 const msg = snapshot.val();
                 if (!msg || typeof msg.text !== "string" || typeof msg.time !== "number") return;
+
+                // 防呆：即使資料庫還殘留舊資料，前端也不顯示 1 小時以前的彈幕。
+                if (Date.now() - msg.time > MESSAGE_TTL_MS) return;
 
                 const date = new Date(msg.time);
                 const pad = n => n.toString().padStart(2, '0');
@@ -624,6 +634,41 @@
                     showWarningModal("Firebase 讀取失敗", "請檢查 Realtime Database Rules 是否允許讀取 danmaku，或 databaseURL 是否正確。");
                 }
             );
+        }
+
+        async function cleanupOldDanmaku(stadiumId = currentStadium?.id) {
+            if (!firebaseReady || !db || !stadiumId) return;
+
+            const cutoff = Date.now() - MESSAGE_TTL_MS;
+
+            try {
+                const oldMessagesSnapshot = await db
+                    .ref(`danmaku/${stadiumId}`)
+                    .orderByChild("time")
+                    .endAt(cutoff)
+                    .once("value");
+
+                if (!oldMessagesSnapshot.exists()) return;
+
+                const updates = {};
+                oldMessagesSnapshot.forEach(child => {
+                    updates[child.key] = null;
+                });
+
+                if (Object.keys(updates).length > 0) {
+                    await db.ref(`danmaku/${stadiumId}`).update(updates);
+                    console.log(`已清除 ${Object.keys(updates).length} 則超過 1 小時的彈幕`, { stadiumId });
+                }
+            } catch (error) {
+                // 通常是 Rules 尚未允許刪除舊資料。不要中斷使用者發彈幕，只在 Console 留紀錄。
+                console.warn("舊彈幕清除失敗", error);
+            }
+        }
+
+        async function cleanupAllOldDanmaku() {
+            for (const stadium of stadiums) {
+                await cleanupOldDanmaku(stadium.id);
+            }
         }
 
         // 審核系統
@@ -733,7 +778,7 @@
             const now = Date.now();
             const stadiumId = currentStadium.id;
             let currentPool = danmakuPools[stadiumId] || [];
-            currentPool = currentPool.filter(msg => now - msg.timestamp < 3600000);
+            currentPool = currentPool.filter(msg => now - msg.timestamp < MESSAGE_TTL_MS);
             danmakuPools[stadiumId] = currentPool; 
 
             // 如果是一般 video，且 video 暫停中，就不發射自動彈幕。
@@ -751,6 +796,10 @@
                 }
             }
         }, 3000); 
+
+        // 定期清理 Firebase 中 1 小時以前的彈幕。
+        // 這是前端觸發式清理：只要有人開著網頁，就會定期清掉舊資料。
+        setInterval(cleanupAllOldDanmaku, CLEANUP_INTERVAL_MS);
 
         // 時鐘更新
         setInterval(() => {
