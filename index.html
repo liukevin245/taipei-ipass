@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>台北通 - 球場即時影像與數據分析</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        :root { --taipei-blue: #008CBA; --taipei-blue-dark: #007399; }
+
+        body { 
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            overscroll-behavior-y: none; font-family: "Microsoft JhengHei", sans-serif; 
+            margin: 0; display: flex; justify-content: center; background-color: #e5e7eb; 
+        }
+
+        #app-container { 
+            width: 100%; max-width: 480px; height: 100%; 
+            display: flex; flex-direction: column; background-color: white; 
+            position: relative; overflow: hidden; box-shadow: 0 0 20px rgba(0,0,0,0.15); 
+        }
+
+        #danmaku-canvas { pointer-events: none; z-index: 20; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+    <script>
+        tailwind.config = {
+            theme: { extend: { colors: { taipei: { main: '#008CBA', dark: '#007399' } } } }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="app-container">
+
+        <header class="bg-taipei-main text-white p-3 flex items-center justify-between shadow-md z-30 flex-shrink-0">
+            <div class="font-bold tracking-wide text-sm sm:text-base">台北運動場館即時影像</div>
+            <div id="status-tag" class="text-[10px] bg-yellow-400/90 text-white px-2 py-1 rounded-full animate-pulse font-medium">Firebase 連線中</div>
+        </header>
+
+        <div class="flex-1 overflow-y-auto overflow-x-hidden relative scroll-smooth bg-gray-50 flex flex-col">
+
+            <!-- 地圖區 -->
+            <div class="relative w-full h-[200px] flex-shrink-0 z-10 bg-gray-200">
+                <div id="map" class="w-full h-full"></div>
+
+                <button id="toggle-heatmap-btn" onclick="toggleHeatmap()" class="absolute top-2 right-2 z-[400] bg-white px-3 py-1.5 rounded-lg shadow-md border border-gray-200 text-gray-700 text-xs font-bold hover:bg-gray-50 flex items-center gap-1.5 transition-all">
+                    <span id="heatmap-indicator" class="w-2 h-2 rounded-full bg-gray-300"></span>
+                    電信人潮圖層
+                </button>
+
+                <button onclick="locateUser()" class="absolute bottom-2 right-2 z-[400] bg-white p-2 rounded-full shadow-md border border-gray-100 text-taipei-main hover:bg-gray-50 active:scale-95 transition-all" title="定位我的位置">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 11 22 2 13 21 11 13 3 11"></polygon></svg>
+                </button>
+            </div>
+
+            <!-- 影片區 -->
+            <div id="video-container" class="relative w-full aspect-video bg-black flex-shrink-0 border-b-2 border-taipei-main shadow-inner">
+
+                <!-- MP4 影片本體：給一般可直接播放的 .mp4 使用 -->
+                <video id="live-video" class="absolute inset-0 w-full h-full object-cover opacity-90 z-10" playsinline muted loop controls></video>
+
+                <!-- Streamable Embed：給古亭河濱籃球場使用 -->
+                <div id="streamable-wrapper" class="absolute inset-0 w-full h-full z-10 hidden bg-black">
+                    <iframe 
+                        id="embed-video"
+                        allow="fullscreen"
+                        allowfullscreen
+                        src="about:blank"
+                        class="absolute inset-0 w-full h-full"
+                        style="border:none; width:100%; height:100%; position:absolute; left:0px; top:0px; overflow:hidden;">
+                    </iframe>
+                </div>
+
+                <!-- 備用快照圖片：當 MP4 影片失敗時顯示 -->
+                <img id="fallback-image" class="absolute inset-0 w-full h-full object-cover opacity-90 z-10 hidden" alt="即時影像快照">
+
+                <!-- 失敗警告標籤 -->
+                <div id="fallback-warning" class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-30 hidden bg-red-600/90 backdrop-blur-sm text-white text-[11px] px-3 py-1.5 rounded-full shadow-lg items-center gap-1.5 whitespace-nowrap">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                    影片載入失敗，已切換至快照
+                </div>
+
+                <!-- 浮水印 -->
+                <div class="absolute top-2 left-2 z-30 text-white font-mono text-[10px] bg-black/60 backdrop-blur-sm p-1.5 rounded-md border border-white/20 shadow pointer-events-none">
+                    <div id="stadium-name-display" class="font-bold text-yellow-400 text-xs mb-0.5">載入中...</div>
+                    <div id="cctv-timestamp" class="tracking-wider opacity-90">載入中...</div>
+                </div>
+
+                <!-- 彈幕畫布 -->
+                <canvas id="danmaku-canvas" class="absolute top-0 left-0 w-full h-full z-20"></canvas>
+            </div>
+
+            <!-- 數據面板 -->
+            <div class="bg-white border-b border-gray-200 shadow-sm z-10 flex-shrink-0">
+                <div class="px-3 py-1.5 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
+                    <span class="text-xs font-bold text-gray-700 flex items-center gap-1">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-taipei-main"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+                        場域綜合分析
+                    </span>
+                    <span class="text-[10px] text-gray-400">即時數據</span>
+                </div>
+
+                <div class="grid grid-cols-2 gap-px bg-gray-100">
+                    <div class="bg-white p-2">
+                        <div class="text-[10px] text-gray-500 mb-0.5">現場人數預估 (影像+電信)</div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span id="info-people" class="font-bold text-gray-800 text-sm">-- 人</span>
+                            <span id="info-trend" class="text-[10px] font-bold px-1 rounded">--</span>
+                        </div>
+                    </div>
+                    <div class="bg-white p-2">
+                        <div class="text-[10px] text-gray-500 mb-0.5">周邊賽事/活動</div>
+                        <div id="info-event" class="font-bold text-taipei-main text-xs mt-1 truncate">讀取中...</div>
+                    </div>
+                    <div class="bg-white p-2 col-span-2 flex justify-between items-center">
+                        <div class="flex items-center gap-1.5">
+                            <span class="text-orange-500"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line></svg></span>
+                            <span id="info-weather" class="text-xs font-medium text-gray-700">讀取中...</span>
+                        </div>
+                        <div id="info-aqi" class="text-[10px] px-2 py-0.5 rounded-full border">AQI: --</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 球場列表 -->
+            <div class="p-2.5 overflow-x-auto flex gap-2 no-scrollbar border-b border-gray-100 bg-white flex-shrink-0" id="stadium-list">
+                <!-- JS 動態產生 -->
+            </div>
+
+            <div class="p-4 text-center text-gray-400 text-xs flex flex-col items-center justify-center min-h-[100px] relative">
+                <span>選擇上方場館檢視即時影像</span>
+                <span class="mt-1 text-[10px] text-gray-300">多人即時彈幕已啟用，每人每 30 秒可發送一次</span>
+            </div>
+        </div>
+
+        <!-- 輸入框 -->
+        <div class="bg-white p-2.5 border-t border-gray-200 shadow-[0_-5px_15px_rgba(0,0,0,0.05)] w-full flex-shrink-0 pb-[calc(env(safe-area-inset-bottom)+10px)] z-30 relative">
+            <div class="flex gap-2">
+                <input type="text" id="danmaku-input" maxlength="80" placeholder="在這裡輸入即時留言..." class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-taipei-main focus:border-transparent transition-all shadow-inner bg-gray-50 focus:bg-white">
+                <button id="send-btn" class="bg-taipei-main hover:bg-taipei-dark text-white font-bold py-2 px-5 rounded-lg text-sm transition-colors active:scale-95 whitespace-nowrap shadow-md">發送</button>
+            </div>
+        </div>
+
+        <!-- 警告彈窗 -->
+        <div id="warning-modal" class="fixed inset-0 z-[500] bg-black/60 hidden flex items-center justify-center backdrop-blur-sm transition-opacity">
+            <div class="bg-white rounded-xl shadow-2xl p-6 w-[80%] max-w-sm transform transition-all text-center">
+                <div class="mx-auto flex items-center justify-center h-12 w-12 rounded-full bg-red-100 mb-4">
+                    <svg class="h-6 w-6 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                    </svg>
+                </div>
+                <h3 id="warning-title" class="text-lg leading-6 font-bold text-gray-900 mb-2">系統提醒</h3>
+                <p id="warning-message" class="text-sm text-gray-500 mb-5">您的留言已自動處理。</p>
+                <button onclick="closeWarningModal()" class="w-full inline-flex justify-center rounded-lg border border-transparent shadow-sm px-4 py-2 bg-taipei-main text-base font-medium text-white hover:bg-taipei-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-taipei-main sm:text-sm">
+                    我知道了
+                </button>
+            </div>
+        </div>
+
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+        import {
+            getDatabase,
+            ref,
+            push,
+            onChildAdded,
+            onValue,
+            query,
+            orderByChild,
+            limitToLast
+        } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
+
+        // === Firebase 設定 ===
+        // 這裡使用你提供的 Firebase Web App 設定，並補上 Realtime Database URL。
+        // 如果 Firebase Console 的 Realtime Database URL 不是這個，請把 databaseURL 改成 Data 分頁顯示的完整 URL。
+        const firebaseConfig = {
+            apiKey: "AIzaSyBgUmQRf2O6IRwTXDmxpT-O1OqP-fclBF4",
+            authDomain: "taipeiipass-f2800.firebaseapp.com",
+            databaseURL: "https://taipeiipass-f2800-default-rtdb.firebaseio.com",
+            projectId: "taipeiipass-f2800",
+            storageBucket: "taipeiipass-f2800.firebasestorage.app",
+            messagingSenderId: "210881365568",
+            appId: "1:210881365568:web:c93ede3904923bd8b481a5",
+            measurementId: "G-9K3RB4YLT1"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getDatabase(app, firebaseConfig.databaseURL);
+
+        // === 發言頻率限制 ===
+        // 不使用匿名登入時，這個限制是「同一瀏覽器」層級。
+        // 使用者清除 localStorage、換瀏覽器、開無痕模式就能繞過；若要伺服器級限制，必須加 Firebase Auth。
+        const RATE_LIMIT_MS = 30000;
+        const LAST_SENT_KEY = "taipei-danmaku-last-sent-at";
+        const myMessageKeys = new Set();
+
+        // === Base64 預設備用圖片 ===
+        const base64DefaultPoster = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4MDAiIGhlaWdodD0iNDUwIiB2aWV3Qm94PSIwIDAgODAwIDQ1MCI+PHJlY3Qgd2lkdGg9IjEwMCUiIGhlaWdodD0iMTAwJSIgZmlsbD0iIzMzMyIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBmb250LWZhbWlseT0ic2Fucy1zZXJpZiIgZm9udC1zaXplPSIyNCIgZmlsbD0iI2RkZCIgZmlsbC1vcGFjaXR5PSIwLjciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGRvbWluYW50LWJhc2VsaW5lPSJtaWRkbGUiPuebrmWJjeeEoeazleS4u+WLleS+m+aHieuHveear+W9seWDjzwvdGV4dD48L3N2Zz4=";
+
+        // === 場館資料 ===
+        // 古亭河濱籃球場使用 Streamable embed。
+        // 其他場館繼續使用可直接播放的 MP4。
+        const stadiums = [
+            { 
+                id: 1, name: "古亭河濱籃球場", lat: 25.0210, lng: 121.5218, 
+                video: null,
+                embed: "https://streamable.com/e/x3p8t3?",
+                poster: base64DefaultPoster,
+                people: 85, trend: "↑ 45%", trendColor: "text-red-600 bg-red-100",
+                event: "🔥 週末三對三鬥牛賽", weather: "晴朗微風，26°C", aqi: "良好 (32)" 
+            },
+            { 
+                id: 2, name: "台大田徑場", lat: 25.0197, lng: 121.5364, 
+                video: "https://www.w3schools.com/html/mov_bbb.mp4#t=5", 
+                embed: null,
+                poster: base64DefaultPoster,
+                people: 42, trend: "↓ 10%", trendColor: "text-green-600 bg-green-100",
+                event: "無特殊活動", weather: "多雲，25°C", aqi: "普通 (55)" 
+            },
+            { 
+                id: 3, name: "新生公園網球場", lat: 25.0685, lng: 121.5320, 
+                video: "https://www.w3schools.com/html/mov_bbb.mp4", 
+                embed: null,
+                poster: base64DefaultPoster,
+                people: 12, trend: "- 平穩", trendColor: "text-gray-600 bg-gray-100",
+                event: "例行場地保養中", weather: "陰天，24°C", aqi: "良好 (40)" 
+            },
+            { 
+                id: 4, name: "天母棒球場", lat: 25.1144, lng: 121.5333, 
+                video: "https://www.w3schools.com/html/mov_bbb.mp4#t=8", 
+                embed: null,
+                poster: base64DefaultPoster,
+                people: 250, trend: "↑ 120%", trendColor: "text-red-600 bg-red-100",
+                event: "⚾ 中職例行賽 (龍 vs 象)", weather: "短暫雨，22°C", aqi: "良好 (25)" 
+            },
+            { 
+                id: 5, name: "大安森林公園籃球場", lat: 25.0315, lng: 121.5358, 
+                video: "https://www.w3schools.com/html/mov_bbb.mp4#t=1", 
+                embed: null,
+                poster: base64DefaultPoster,
+                people: 68, trend: "↑ 20%", trendColor: "text-red-600 bg-red-100",
+                event: "街頭籃球推廣活動", weather: "晴朗，27°C", aqi: "良好 (28)" 
+            },
+            { 
+                id: 6, name: "市民大道籃球場", lat: 25.0450, lng: 121.5330, 
+                video: "https://www.w3schools.com/html/mov_bbb.mp4#t=6", 
+                embed: null,
+                poster: base64DefaultPoster,
+                people: 105, trend: "↑ 80%", trendColor: "text-red-600 bg-red-100",
+                event: "無特殊活動", weather: "多雲，26°C", aqi: "普通 (60)" 
+            }
+        ];
+
+        let currentStadium = stadiums[0];
+        const stadiumMarkers = {}; 
+        let danmakus = []; 
+        let isHeatmapActive = false;
+        let heatmapLayers = []; 
+        let firebaseUnsubscribe = null;
+        let seenFirebaseKeys = new Set();
+
+        let danmakuPools = {
+            1: [
+                { text: "今天好多人，還要排隊", isSelf: false, timestamp: Date.now() - 600000, timeStr: "[12:05] " },
+                { text: "那個穿黑衣的打球很**欸", isSelf: false, timestamp: Date.now() - 400000, timeStr: "[12:11] " }
+            ],
+            2: [{ text: "天氣不錯適合跑步", isSelf: false, timestamp: Date.now() - 300000, timeStr: "[12:10] " }],
+            3: [
+                { text: "第四場地還空著", isSelf: false, timestamp: Date.now() - 900000, timeStr: "[11:55] " },
+                { text: "場地旁邊都是**，大家小心", isSelf: false, timestamp: Date.now() - 200000, timeStr: "[12:15] " }
+            ],
+            4: [
+                { text: "滿場了啦進不去", isSelf: false, timestamp: Date.now() - 1500000, timeStr: "[11:45] " },
+                { text: "這裁判真的是**", isSelf: false, timestamp: Date.now() - 800000, timeStr: "[12:02] " }
+            ],
+            5: [{ text: "大安人超多！", isSelf: false, timestamp: Date.now() - 200000, timeStr: "[12:15] " }],
+            6: [
+                { text: "橋下不會淋雨，讚", isSelf: false, timestamp: Date.now() - 400000, timeStr: "[12:08] " },
+                { text: "**！又沒投進", isSelf: false, timestamp: Date.now() - 100000, timeStr: "[12:20] " }
+            ]
+        };
+
+        // === Firebase 連線狀態 ===
+        const statusTag = document.getElementById('status-tag');
+        onValue(ref(db, ".info/connected"), (snapshot) => {
+            if (snapshot.val() === true) {
+                statusTag.innerText = "多人彈幕已連線";
+                statusTag.className = "text-[10px] bg-green-400/90 text-white px-2 py-1 rounded-full animate-pulse font-medium";
+            } else {
+                statusTag.innerText = "Firebase 連線中";
+                statusTag.className = "text-[10px] bg-yellow-400/90 text-white px-2 py-1 rounded-full animate-pulse font-medium";
+            }
+        });
+
+        // === 地圖系統初始化 ===
+        let map;
+        try {
+            map = L.map('map', { zoomControl: false }).setView([25.045, 121.54], 12);
+            L.control.zoom({ position: 'topleft' }).addTo(map);
+            L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OSMap' }).addTo(map);
+
+            const defaultMarkerStyle = { color: '#008CBA', fillColor: '#008CBA', fillOpacity: 0.6, radius: 7, weight: 2 };
+
+            stadiums.forEach(s => {
+                const marker = L.circleMarker([s.lat, s.lng], defaultMarkerStyle).addTo(map);
+                marker.bindPopup(`<b>${s.name}</b>`);
+                marker.on('click', () => switchStadium(s.id));
+                stadiumMarkers[s.id] = marker;
+            });
+        } catch(e) {
+            console.log("地圖載入失敗，可能在無網路環境", e);
+        }
+
+        function toggleHeatmap() {
+            if(!map) return;
+            isHeatmapActive = !isHeatmapActive;
+            const btn = document.getElementById('toggle-heatmap-btn');
+            const indicator = document.getElementById('heatmap-indicator');
+
+            if (isHeatmapActive) {
+                btn.classList.add('bg-red-50', 'border-red-200');
+                indicator.classList.replace('bg-gray-300', 'bg-red-500');
+                indicator.classList.add('animate-pulse');
+
+                stadiums.forEach(stadium => {
+                    const numDots = Math.min(stadium.people, 100); 
+                    const maxRadius = 0.0003; 
+
+                    for (let i = 0; i < numDots; i++) {
+                        const angle = Math.random() * Math.PI * 2;
+                        const r = Math.pow(Math.random(), 1.5) * maxRadius; 
+                        const dotLat = stadium.lat + r * Math.cos(angle);
+                        const dotLng = stadium.lng + r * Math.sin(angle);
+
+                        const dot = L.circleMarker([dotLat, dotLng], {
+                            radius: 3 + Math.random() * 2, 
+                            color: 'transparent',
+                            fillColor: '#ef4444', 
+                            fillOpacity: 0.3 + Math.random() * 0.4, 
+                            interactive: false 
+                        }).addTo(map);
+                        heatmapLayers.push(dot);
+                    }
+                });
+            } else {
+                btn.classList.remove('bg-red-50', 'border-red-200');
+                indicator.classList.replace('bg-red-500', 'bg-gray-300');
+                indicator.classList.remove('animate-pulse');
+
+                heatmapLayers.forEach(layer => map.removeLayer(layer));
+                heatmapLayers = [];
+            }
+        }
+
+        let userLocationMarker = null;
+
+        function initUserLocation() {
+            if(!map) return;
+            const lat = 25.0375; 
+            const lng = 121.5637;
+            userLocationMarker = L.circleMarker([lat, lng], {
+                color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.8, radius: 8, weight: 3, className: 'animate-pulse'
+            }).addTo(map).bindPopup("<b>您的位置 (電信定位)</b>");
+        }
+
+        function locateUser() {
+            if(!map) return;
+            const lat = 25.0375; 
+            const lng = 121.5637;
+            if (!userLocationMarker) initUserLocation();
+            map.flyTo([lat, lng], 13, { duration: 1.5 });
+            userLocationMarker.openPopup();
+        }
+
+        // === 影片與 Embed 切換系統 ===
+        const videoElement = document.getElementById('live-video');
+        const streamableWrapper = document.getElementById('streamable-wrapper');
+        const embedFrame = document.getElementById('embed-video');
+        const fallbackImage = document.getElementById('fallback-image');
+        const fallbackWarning = document.getElementById('fallback-warning');
+
+        if(videoElement) {
+            videoElement.addEventListener('error', () => {
+                console.warn("MP4 影片載入失敗，降級為 Base64 快照模式", {
+                    stadium: currentStadium?.name,
+                    src: videoElement.currentSrc,
+                    code: videoElement.error?.code,
+                    message: videoElement.error?.message
+                });
+
+                videoElement.style.display = 'none';
+
+                if (streamableWrapper) {
+                    streamableWrapper.style.display = 'none';
+                }
+
+                fallbackImage.src = currentStadium.poster;
+                fallbackImage.style.display = 'block';
+                fallbackWarning.style.display = 'flex';
+
+                setTimeout(() => { 
+                    fallbackWarning.style.display = 'none'; 
+                }, 3000);
+            });
+        }
+
+        function resetVideoArea() {
+            fallbackImage.style.display = 'none';
+            fallbackWarning.style.display = 'none';
+
+            if (videoElement) {
+                videoElement.pause();
+                videoElement.removeAttribute('src');
+                videoElement.load();
+                videoElement.style.display = 'none';
+            }
+
+            if (streamableWrapper) {
+                streamableWrapper.style.display = 'none';
+            }
+
+            if (embedFrame) {
+                embedFrame.src = 'about:blank';
+            }
+        }
+
+        function switchStadium(id) {
+            currentStadium = stadiums.find(s => s.id === id);
+            danmakus = [];
+
+            document.getElementById('stadium-name-display').innerText = currentStadium.name;
+            document.getElementById('info-people').innerText = `${currentStadium.people} 人`;
+
+            const trendEl = document.getElementById('info-trend');
+            trendEl.innerText = currentStadium.trend;
+            trendEl.className = `text-[10px] font-bold px-1 rounded ${currentStadium.trendColor}`;
+
+            document.getElementById('info-event').innerText = currentStadium.event;
+            document.getElementById('info-weather').innerText = currentStadium.weather;
+
+            const aqiEl = document.getElementById('info-aqi');
+            aqiEl.innerText = `AQI: ${currentStadium.aqi}`;
+
+            if(currentStadium.aqi.includes("良好")) {
+                aqiEl.className = "text-[10px] px-2 py-0.5 rounded-full bg-green-100 text-green-700 border border-green-200";
+            } else {
+                aqiEl.className = "text-[10px] px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700 border border-yellow-200";
+            }
+
+            if(map) {
+                Object.values(stadiumMarkers).forEach(marker => {
+                    if(marker && marker.setStyle) {
+                        marker.setStyle({ color: '#008CBA', fillColor: '#008CBA', fillOpacity: 0.6, radius: 7, weight: 2 });
+                    }
+                });
+
+                if (stadiumMarkers[id] && stadiumMarkers[id].setStyle) {
+                    stadiumMarkers[id].setStyle({ color: '#F59E0B', fillColor: '#F59E0B', fillOpacity: 0.9, radius: 10, weight: 3 });
+                }
+            }
+
+            resetVideoArea();
+
+            if (currentStadium.embed) {
+                streamableWrapper.style.display = 'block';
+                embedFrame.src = currentStadium.embed;
+            } else if (currentStadium.video) {
+                videoElement.style.display = 'block';
+                videoElement.src = currentStadium.video;
+                videoElement.poster = currentStadium.poster;
+
+                const playPromise = videoElement.play();
+                if (playPromise !== undefined) {
+                    playPromise.catch(() => {
+                        console.log("瀏覽器要求使用者手動點擊播放");
+                    });
+                }
+            } else {
+                fallbackImage.src = currentStadium.poster;
+                fallbackImage.style.display = 'block';
+            }
+
+            renderStadiumList();
+            startFirebaseDanmakuListener(currentStadium.id);
+        }
+
+        function renderStadiumList() {
+            const list = document.getElementById('stadium-list');
+            list.innerHTML = stadiums.map(s => `
+                <div onclick="switchStadium(${s.id})" class="flex-shrink-0 px-3 py-1.5 rounded-full text-[11px] sm:text-xs font-bold cursor-pointer transition-all border ${s.id === currentStadium.id ? 'bg-taipei-main text-white border-taipei-main shadow-md' : 'bg-white text-gray-600 border-gray-200 hover:border-taipei-main hover:text-taipei-main'}">
+                    ${s.name}
+                </div>
+            `).join('');
+        }
+
+        // === 彈幕系統 ===
+        const canvas = document.getElementById('danmaku-canvas');
+        let ctx = null;
+        if(canvas) ctx = canvas.getContext('2d');
+        const container = document.getElementById('video-container');
+
+        function resize() {
+            if(canvas && container) {
+                canvas.width = container.clientWidth;
+                canvas.height = container.clientHei         }
+        }
+
+        window.addEventListener('resize', resize);
+        setTimeout(resize, 100);
+
+        class Bullet {
+            constructor(text, isSelf = false, predefinedTimeStr = null) {
+                let timeString = predefinedTimeStr;
+
+                if (!timeString) {
+                    const now = new Date();
+                    const pad = n => n.toString().padStart(2, '0');
+                    timeString = `[${pad(now.getHours())}:${pad(now.getMinutes())}] `;
+                }
+
+                this.originalTimeStr = timeString;
+                this.text = timeString + text; 
+                this.x = canvas.width;
+                this.y = Math.random() * (canvas.height - 40) + 20;
+                this.speed = canvas.width / (400 + Math.random() * 150); 
+                this.color = isSelf ? '#FFD700' : '#FFFFFF';
+                this.fontSize = 14;
+                this.font = `bold ${this.fontSize}px "Microsoft JhengHei", sans-serif`;
+            }
+
+            draw() {
+                if(!ctx) return;
+
+                ctx.font = this.font;
+                ctx.textBaseline = 'top';
+                ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+                ctx.shadowBlur = 3;
+                ctx.shadowOffsetX = 1;
+                ctx.shadowOffsetY = 1;
+                ctx.fillStyle = this.color;
+                ctx.fillText(this.text, this.x, this.y);
+                ctx.shadowBlur = 0; 
+                this.x -= this.speed;
+            }
+        }
+
+        function animate() {
+            if(!ctx || !canvas) return;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            danmakus = danmakus.filter(b => b.x + ctx.measureText(b.text).width > 0);
+            danmakus.forEach(b => b.draw());
+
+            requestAnimationFrame(animate);
+        }
+
+        animate();
+
+        function startFirebaseDanmakuListener(stadiumId) {
+            if (typeof firebaseUnsubscribe === "function") {
+                firebaseUnsubscribe();
+                firebaseUnsubscribe = null;
+            }
+
+            seenFirebaseKeys = new Set();
+
+            const danmakuQuery = query(
+                ref(db, `danmaku/${stadiumId}`),
+                orderByChild("time"),
+                limitToLast(30)
+            );
+
+            firebaseUnsubscribe = onChildAdded(
+                danmakuQuery,
+                (snapshot) => {
+                    if (seenFirebaseKeys.has(snapshot.key)) return;
+                    seenFirebaseKeys.add(snapshot.key);
+
+                    const msg = snapshot.val();
+                    if (!msg || typeof msg.text !== "string" || typeof msg.time !== "number") return;
+
+                    const date = new Date(msg.time);
+                    const pad = n => n.toString().padStart(2, '0');
+                    const timeStr = `[${pad(date.getHours())}:${pad(date.getMinutes())}] `;
+                    const isSelf = myMessageKeys.has(snapshot.key);
+
+                    if (!danmakuPools[stadiumId]) {
+                        danmakuPools[stadiumId] = [];
+                    }
+
+                    danmakuPools[stadiumId].push({
+                        text: msg.text,
+                        isSelf,
+                        timestamp: msg.time,
+                        timeStr
+                    });
+
+                    // 15 秒內的新訊息直接顯示；較舊的 last 30 則留給下方輪播機制慢慢顯示，避免切換場館時一次爆量。
+                    if (Date.now() - msg.time <= 15000) {
+                        danmakus.push(new Bullet(msg.text, isSelf, timeStr));
+                    }
+                },
+                (error) => {
+                    console.error("Firebase 彈幕讀取失敗", error);
+                    showWarningModal("Firebase 讀取失敗", "請檢查 Realtime Database Rules 是否允許讀取 danmaku，或 databaseURL 是否正確。");
+                }
+            );
+        }
+
+        // 審核系統
+        function showWarningModal(title = "系統提醒", message = "您的留言已自動處理。") {
+            document.getElementByIdg-title').innerText = title;
+            document.getElementById('warning-message').innerHTML = message;
+            document.getElementById('warning-modal').classList.remove('hidden');
+        }
+
+        function closeWarningModal() {
+            document.getElementById('warning-modal').classList.add('hidden');
+        }
+
+        const badWords = ['幹', '乾你', '淦', '靠杯', '靠北', '靠邀', '靠腰', '媽的', '他媽', '三小', '白痴', '智障', '低能', '腦殘', '廢物', '垃圾', '去死', '滾', '閉嘴', '王八蛋', '賤人', '操你', 'fuck', 'shit', 'bitch', 'asshole'];
+
+        function getRemainingCooldownMs() {
+            const lastSentAt = Number(localStorage.getItem(LAST_SENT_KEY) || 0);
+            return Math.max(0, RATE_LIMIT_MS - (Date.now() - lastSentAt));
+        }
+
+        function updateSendButtonCooldown() {
+            const btn = document.getElementById('send-btn');
+            const remaining = getRemainingCooldownMs();
+
+            if (remaining > 0) {
+             onst seconds = Math.ceil(remaining / 1000);
+                btn.disabled = true;
+                btn.innerText = `${seconds}s`;
+                btn.classList.add('opacity-60', 'cursor-not-allowed');
+            } else {
+                btn.disabled = false;
+                btn.innerText = "發送";
+                btn.classList.remove('opacity-60', 'cursor-not-allowed');
+            }
+        }
+
+        setInterval(updateSendButtonCooldown, 500);
+
+        async function sendMessage() {
+            const inp document.getElementById('danmaku-input');
+            if(!input) return;
+
+            const remaining = getRemainingCooldownMs();
+            if (remaining > 0) {
+                showWarningModal("發送太頻繁", `請再等 <span class="font-bold text-red-500">${Math.ceil(remaining / 1000)}</span> 秒後再發送。`);
+                return;
+            }
+
+            let originalText = input.value.trim();
+            if(!originalText) return;
+
+            if (originalText.length > 80) {
+               t = originalText.slice(0, 80);
+            }
+
+            let filteredText = originalText;
+            let hasBadWord = false;
+
+            badWords.forEach(word => {
+                const regex = new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                if (regex.test(filteredText)) {
+                    hasBadWord = true;
+                    filteredText = filteredText.replace(regex, '**');
+                }
+            });
+
+            if (hasBadWord) {
+                showWarningModal("系統提醒", "留言含有不當字詞，已自動遮蔽後送出。");
+            }
+
+            try {
+                const now = Date.now();
+                const newMessageRef = push(ref(db, `danmaku/${currentStadium.id}`), {
+                    text: filteredText,
+                    time: now
+                });
+
+                if (newMessageRef.key) {
+                    myMessageKeys.add(newMessageRef.key);
+                }
+
+                await newMessageRef;
+
+                localStorageT_SENT_KEY, String(now));
+                input.value = "";
+                input.blur();
+                updateSendButtonCooldown();
+            } catch (error) {
+                console.error("Firebase 彈幕寫入失敗", error);
+                showWarningModal("留言送出失敗", "請檢查 Firebase Realtime Database Rules、databaseURL，或確認訊息沒有違反資料庫規則。");
+            }
+        }
+
+        document.getElementById('send-btn').onclick = sendMessage;
+
+        document.getElementById('danmaku-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        // 歷史彈幕輪播
+        setInterval(() => {
+            const now = Date.now();
+            const stadiumId = currentStadium.id;
+            let currentPool = danmakuPools[stadiumId] || [];
+            currentPool = currentPool.filter(msg => now - msg.timestamp < 3600000);
+            danmakuPools[stadiumId] = currentPool; 
+
+            // 如果是一般 video，且 就不發射自動彈幕。
+            // 如果是 Streamable iframe，無法直接讀取播放狀態，因此彈幕照常輪播。
+            const isUsingEmbed = !!currentStadium.embed;
+            if (!isUsingEmbed && videoElement && videoElement.paused && videoElement.style.display !== 'none') return;
+
+            if (currentPool.length > 0 && danmakus.length < 10) {
+                const randomMsg = currentPool[Math.floor(Math.random() * currentPool.length)];
+                const fullText = randomM.timeStr + randomMsg.text;
+                const isRepeated = danmakus.some(b => b.text === fullText);
+
+                if (!isRepeated) {
+                    danmakus.push(new Bullet(randomMsg.text, randomMsg.isSelf, randomMsg.timeStr));
+                }
+            }
+        }, 3000); 
+
+        // 時鐘更新
+        setInterval(() => {
+            const now = new Date();
+            const timeEl = document.getElementById('cctv-timestamp');
+            if(timeEl) {
+                timeEl.innerText = noweString('zh-TW', { hour12: false });
+            }
+        }, 1000);
+
+        // 提供給 inline onclick 使用
+        window.toggleHeatmap = toggleHeatmap;
+        window.locateUser = locateUser;
+        window.switchStadium = switchStadium;
+        window.closeWarningModal = closeWarningModal;
+
+        // 啟動
+        setTimeout(() => {
+            initUserLocation(); 
+            switchStadium(1);
+            updateSendButtonCooldown();
+        }, 500);
+
+    </script>
+</body>
+</html>
+
